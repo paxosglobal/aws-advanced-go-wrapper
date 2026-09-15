@@ -367,3 +367,176 @@ func TestClusterTopologyMonitorRecoversPromotedClusterWhenStalled(t *testing.T) 
 	assert.NoError(t, err)
 	assert.NotEmpty(t, hosts)
 }
+
+// laggingDnsStrategy models a pod that starts up, or resets, *during* the
+// switchover rather than after it: its topology cache is empty, so the monitor
+// takes the pre-existing empty-cache fallback to the initial host — but the
+// global endpoint's DNS has not followed the switchover yet, so that host
+// answers as a reader in the demoted region. Once DNS catches up, the very same
+// initial host becomes the promoted writer.
+//
+// The distinction that matters is the state this leaves behind: the monitor now
+// holds a monitoring connection (to a non-writer) instead of none at all, which
+// is still panic mode — isInPanicMode is `monitoringConn == nil ||
+// !isVerifiedWriterConn`.
+type laggingDnsStrategy struct {
+	initialHost string
+	staleHosts  []*host_info_util.HostInfo
+	newHosts    []*host_info_util.HostInfo
+	promoted    atomic.Bool
+}
+
+// dnsPinnedConn records what the initial host resolved to at the moment the
+// connection was opened. A TCP connection does not follow DNS: one opened before
+// the switchover keeps talking to the demoted region for its whole life, however
+// the global endpoint resolves afterwards. Only a *new* connection sees the
+// promotion — which is exactly why re-consulting the initial host has to mean
+// dialing it again, not re-querying a connection already in hand.
+type dnsPinnedConn struct {
+	driver.Conn
+	host     string
+	promoted bool
+}
+
+func (s *laggingDnsStrategy) isPromotedInitialHost(conn driver.Conn) bool {
+	pinned, ok := conn.(*dnsPinnedConn)
+	return ok && pinned.host == s.initialHost && pinned.promoted
+}
+
+func (s *laggingDnsStrategy) QueryForTopology(conn driver.Conn) ([]*host_info_util.HostInfo, error) {
+	if s.isPromotedInitialHost(conn) {
+		return s.newHosts, nil
+	}
+	return s.staleHosts, nil
+}
+
+func (s *laggingDnsStrategy) GetInstanceTemplate(string, driver.Conn) (*host_info_util.HostInfo, error) {
+	return nil, nil
+}
+
+func (s *laggingDnsStrategy) IsWriterInstance(conn driver.Conn) (bool, error) {
+	return s.isPromotedInitialHost(conn), nil
+}
+
+func (s *laggingDnsStrategy) GetInstanceId(conn driver.Conn) (string, string) {
+	if s.isPromotedInitialHost(conn) {
+		return s.newHosts[0].HostId, s.newHosts[0].GetHost()
+	}
+	return "", ""
+}
+
+func (s *laggingDnsStrategy) CreateHost(
+	_, _ string, _ bool, _ int, _ time.Time, initialHost, _ *host_info_util.HostInfo,
+) *host_info_util.HostInfo {
+	return initialHost
+}
+
+// TestClusterTopologyMonitorRechecksInitialHostWhileHoldingNonWriterConn covers
+// the case the other three miss. They all start from `monitoringConn == nil`,
+// and their initial host reports as the writer on the very first recheck. But
+// panic mode does not require a nil monitoring connection — an unverified one is
+// enough — and openAnyConnectionAndUpdateTopology only dials the initial host
+// `if c.loadConn(c.monitoringConn) == nil`. A monitor that is stalled while
+// *holding* a connection to a non-writer therefore never re-consults the initial
+// host at all; it re-queries the demoted region through the connection it
+// already has.
+//
+// Reaching that state needs no contrivance: an empty cache sends the monitor
+// down the pre-existing fallback, and a global endpoint whose DNS has not yet
+// flipped hands it exactly such a connection.
+func TestClusterTopologyMonitorRechecksInitialHostWhileHoldingNonWriterConn(t *testing.T) {
+	originalInterval := driver_infrastructure.InitialHostRecheckIntervalNano
+	driver_infrastructure.InitialHostRecheckIntervalNano = 100 * time.Millisecond
+	defer func() { driver_infrastructure.InitialHostRecheckIntervalNano = originalInterval }()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	initialHostInfo := staleHost(t, "cluster.global-mno.global.rds.amazonaws.com")
+	staleHosts := []*host_info_util.HostInfo{
+		staleHost(t, "old-region-instance-0.mno.us-east-1.rds.amazonaws.com"),
+		staleHost(t, "old-region-instance-1.mno.us-east-1.rds.amazonaws.com"),
+	}
+	promotedHost := staleHost(t, "new-region-instance-0.pqr.us-west-2.rds.amazonaws.com")
+
+	mockDialect := mock_driver_infrastructure.NewMockDriverDialect(ctrl)
+	mockDialect.EXPECT().IsClosed(gomock.Any()).Return(false).AnyTimes()
+
+	mockPluginService := mock_driver_infrastructure.NewMockPluginService(ctrl)
+	mockPluginService.EXPECT().GetTargetDriverDialect().Return(mockDialect).AnyTimes()
+	mockPluginService.EXPECT().IsNetworkError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().IsLoginError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().SetAvailability(gomock.Any(), gomock.Any()).AnyTimes()
+	mockPluginService.EXPECT().GetHostRole(gomock.Any()).Return(host_info_util.READER).AnyTimes()
+	strategy := &laggingDnsStrategy{
+		initialHost: initialHostInfo.GetHost(),
+		staleHosts:  staleHosts,
+		newHosts:    []*host_info_util.HostInfo{promotedHost},
+	}
+
+	// Each connection is pinned to whatever DNS said at the moment it was opened.
+	mockPluginService.EXPECT().
+		ForceConnect(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(hostInfo *host_info_util.HostInfo, _ *utils.RWMap[string, string]) (driver.Conn, error) {
+			return &dnsPinnedConn{
+				Conn:     &MockConn{},
+				host:     hostInfo.GetHost(),
+				promoted: strategy.promoted.Load(),
+			}, nil
+		}).
+		AnyTimes()
+
+	publisher := services.NewEventPublisher()
+	storage := services.NewExpiringStorage(time.Minute, publisher)
+	container := &services.FullServicesContainer{Storage: storage, Events: publisher}
+
+	// Registered so the cache writes below actually land, but deliberately not
+	// seeded: the empty cache is what drives the monitor to the initial host
+	// before DNS has flipped.
+	driver_infrastructure.TopologyStorageType.Register(storage)
+	_, found := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+	require.False(t, found, "cache must start empty for the monitor to take the fallback path")
+
+	monitor := driver_infrastructure.NewClusterTopologyMonitorImpl(
+		container,
+		staleTopologyClusterId,
+		10*time.Millisecond,
+		10*time.Millisecond,
+		time.Minute,
+		utils.NewRWMap[string, string](),
+		initialHostInfo,
+		initialHostInfo,
+		mockPluginService,
+		strategy,
+	)
+
+	monitor.Start()
+	defer monitor.Stop()
+
+	// The monitor falls back to the initial host, finds a non-writer, and caches
+	// the demoted region's topology through that connection. Asserting this is
+	// what proves the test reached the state it is about, rather than passing
+	// from the nil-connection path the other tests already cover.
+	require.Eventually(t, func() bool {
+		topology, ok := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+		return ok && len(topology.GetHosts()) == len(staleHosts)
+	}, 5*time.Second, 20*time.Millisecond,
+		"monitor never cached the demoted region's topology, so it never held a connection to a non-writer")
+
+	// DNS now follows the switchover: the initial host is the promoted writer.
+	strategy.promoted.Store(true)
+
+	assert.Eventually(t, func() bool {
+		topology, ok := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+		if !ok {
+			return false
+		}
+		for _, h := range topology.GetHosts() {
+			if h.GetHost() == promotedHost.GetHost() {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond,
+		"monitor kept re-querying the connection it already held to the demoted region and never re-consulted the initial host")
+}

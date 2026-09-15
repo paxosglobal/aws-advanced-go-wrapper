@@ -454,9 +454,84 @@ func (c *ClusterTopologyMonitorImpl) recheckInitialHostIfStalled() {
 	slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.recheckingInitialHost",
 		c.initialHostInfo.GetHost(), (time.Duration(now-c.panicModeStart.Load())).String()))
 
-	if _, err := c.openAnyConnectionAndUpdateTopology(); err != nil {
+	if c.loadConn(c.monitoringConn) == nil {
+		// No monitoring connection held, so the existing path already dials the
+		// initial host.
+		if _, err := c.openAnyConnectionAndUpdateTopology(); err != nil {
+			slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.monitoringConnectionFailed",
+				c.initialHostInfo.GetHost(), err))
+		}
+		return
+	}
+
+	c.probeInitialHostForWriter()
+}
+
+// probeInitialHostForWriter opens a fresh connection to the initial host while a
+// monitoring connection is already held, and keeps it only if it is the writer.
+//
+// Panic mode does not require a nil monitoring connection — an unverified one is
+// enough — and openAnyConnectionAndUpdateTopology dials the initial host only
+// when none is held, adopting it only through a CAS against an empty container.
+// Once the monitor holds an unverified connection neither fires again, so
+// without this probe the recheck degenerates into re-querying that same
+// connection.
+//
+// A held connection cannot answer the question in any case: it is pinned to
+// whatever the endpoint resolved to when it was opened, whereas the whole point
+// of the recheck is that DNS has since followed the switchover. Only a new
+// connection observes the promotion.
+//
+// The probe is discarded unless it verifies a writer, so a stall costs one
+// connection per interval and the held connection is never disturbed.
+func (c *ClusterTopologyMonitorImpl) probeInitialHostForWriter() {
+	conn, err := c.pluginService.ForceConnect(c.initialHostInfo, c.monitoringProps)
+	if err != nil || conn == nil {
 		slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.monitoringConnectionFailed",
 			c.initialHostInfo.GetHost(), err))
+		return
+	}
+
+	isWriterInstance, getWriterNameErr := c.topologyQueryStrategy.IsWriterInstance(conn)
+	if getWriterNameErr != nil || !isWriterInstance {
+		// Still not the writer. Keep the connection already in hand.
+		c.closeConnection(conn)
+		return
+	}
+
+	// Swap before recording, so isVerifiedWriterConn is never true while
+	// monitoringConn still holds the superseded connection.
+	slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.openedMonitoringConnection", c.initialHostInfo.GetHost()))
+	c.closeConnection(c.loadConn(c.monitoringConn))
+	c.monitoringConn.Store(ConnectionContainer{conn})
+	c.recordInitialHostAsWriter(conn)
+	c.fetchTopologyAndUpdateCache(conn)
+}
+
+// recordInitialHostAsWriter marks conn — the current monitoring connection,
+// opened against initialHostInfo and already confirmed to be the writer — as the
+// verified writer connection, and records which host that is.
+//
+// This deliberately mirrors the adoption block inside
+// openAnyConnectionAndUpdateTopology rather than replacing it, so that this
+// change adds code without modifying any. The two must be kept in step: both
+// exist to answer "the initial host turned out to be the writer, now what", and
+// writerHostInfo is read when seeding host routines and by the reader routines'
+// writer-change detection, so a stale value here is not inert.
+func (c *ClusterTopologyMonitorImpl) recordInitialHostAsWriter(conn driver.Conn) {
+	c.isVerifiedWriterConn.Store(true)
+
+	if utils.IsRdsInstance(c.initialHostInfo.GetHost()) {
+		c.writerHostInfo.Store(c.initialHostInfo)
+		slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.writerMonitoringConnection", c.writerHostInfo.Load().GetHost()))
+		return
+	}
+
+	hostId, hostName := c.topologyQueryStrategy.GetInstanceId(conn)
+	if hostId != "" || hostName != "" {
+		instanceTemplate := c.getInstanceTemplate(hostName, conn)
+		c.writerHostInfo.Store(c.topologyQueryStrategy.CreateHost(hostId, hostName, true, 0, time.Time{}, c.initialHostInfo, instanceTemplate))
+		slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.writerMonitoringConnection", c.writerHostInfo.Load().GetHost()))
 	}
 }
 
