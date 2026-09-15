@@ -35,6 +35,23 @@ var FallbackTopologyRefreshTimeoutMs = 1100
 var topologyUpdateWaitTime = time.Millisecond * 1000
 var stableTopologiesDurationNano = time.Second * 15
 
+// InitialHostRecheckIntervalNano bounds how long the monitor will rely solely on
+// its cached host list while it is unable to verify a writer.
+//
+// Panic mode falls back to the initial host only when the cached host list is
+// empty, and that cache can be both stale and self-renewing. After a global
+// database switchover the cached hosts are the previous region's instances,
+// which remain reachable as read-only secondaries: no writer is ever verified,
+// while checkForStableReaderTopologies keeps rewriting that same topology and
+// refreshing its TTL. The cache therefore never empties and the fallback never
+// runs, so the monitor cannot discover the promoted cluster.
+//
+// The initial host is the cluster or global endpoint, whose DNS does follow the
+// switchover, so re-consulting it on an interval is what breaks the cycle. The
+// interval is long enough that an ordinary failover — which leaves panic mode in
+// seconds — never reaches it.
+var InitialHostRecheckIntervalNano = time.Second * 30
+
 const (
 	initialBackoffMs = 100
 	maxBackoffMs     = 10000
@@ -87,6 +104,8 @@ type ClusterTopologyMonitorImpl struct {
 	readerTopologiesById           *utils.RWMap[string, []*host_info_util.HostInfo]
 	completedOneCycle              *utils.RWMap[string, bool]
 	stableTopologiesStart          atomic.Int64 // UnixNano; 0 means "not tracking"
+	panicModeStart                 atomic.Int64 // UnixNano; 0 means "not in panic mode"
+	lastInitialHostRecheck         atomic.Int64 // UnixNano; 0 means "never rechecked"
 	topologyQueryStrategy          TopologyQueryStrategy
 }
 
@@ -226,9 +245,12 @@ func (c *ClusterTopologyMonitorImpl) Monitor() {
 				}
 			}
 			c.checkForStableReaderTopologies()
+			c.recheckInitialHostIfStalled()
 			c.delay(true)
 		} else {
 			// Regular mode (not panic mode).
+			c.panicModeStart.Store(0)
+			c.lastInitialHostRecheck.Store(0)
 
 			if utils.LengthOfSyncMap(c.hostRoutines) != 0 {
 				c.hostRoutinesStop.Store(true)
@@ -398,6 +420,46 @@ func (c *ClusterTopologyMonitorImpl) checkForStableReaderTopologies() {
 
 // calculateBackoffWithJitter returns an exponential backoff duration with jitter.
 // backoff = min(initialBackoffMs * 2^min(attempt, 6), maxBackoffMs) * random(0.5, 1.0).
+// recheckInitialHostIfStalled re-opens a connection to the initial host once the
+// monitor has spent longer than InitialHostRecheckIntervalNano in panic mode
+// without verifying a writer.
+//
+// This is the escape from a stale, self-renewing topology cache: the cached
+// hosts never empty, so the fallback inside the panic-mode branch never fires on
+// its own. See InitialHostRecheckIntervalNano.
+//
+// It is a no-op until the monitor has been stalled for a full interval, so an
+// ordinary failover never pays for an extra connection.
+func (c *ClusterTopologyMonitorImpl) recheckInitialHostIfStalled() {
+	now := time.Now().UnixNano()
+
+	if c.panicModeStart.CompareAndSwap(0, now) {
+		// Just entered panic mode; start the clock rather than rechecking.
+		c.lastInitialHostRecheck.Store(now)
+		return
+	}
+
+	last := c.lastInitialHostRecheck.Load()
+	if last == 0 {
+		c.lastInitialHostRecheck.Store(now)
+		return
+	}
+	if now-last < InitialHostRecheckIntervalNano.Nanoseconds() {
+		return
+	}
+	if !c.lastInitialHostRecheck.CompareAndSwap(last, now) {
+		return
+	}
+
+	slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.recheckingInitialHost",
+		c.initialHostInfo.GetHost(), (time.Duration(now-c.panicModeStart.Load())).String()))
+
+	if _, err := c.openAnyConnectionAndUpdateTopology(); err != nil {
+		slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.monitoringConnectionFailed",
+			c.initialHostInfo.GetHost(), err))
+	}
+}
+
 func calculateBackoffWithJitter(attempt int) time.Duration {
 	exp := math.Min(float64(attempt), 6)
 	backoff := float64(initialBackoffMs) * math.Round(math.Pow(2, exp))
@@ -435,6 +497,8 @@ func (c *ClusterTopologyMonitorImpl) reset() {
 	c.isVerifiedWriterConn.Store(false)
 	c.writerHostInfo.Store(nil)
 	c.highRefreshRateEndTimeInNanos = 0
+	c.panicModeStart.Store(0)
+	c.lastInitialHostRecheck.Store(0)
 	c.requestToUpdateTopology.Store(false)
 
 	// Clear topology cache
