@@ -229,3 +229,141 @@ func TestClusterTopologyMonitorDoesNotRecheckImmediately(t *testing.T) {
 	assert.Zero(t, initialHostConnects.Load(),
 		"monitor re-consulted the initial host before the recheck interval elapsed")
 }
+
+// identifiedConn tags a connection with the host it was opened against, so a
+// strategy can answer differently for the initial host than for cached hosts.
+type identifiedConn struct {
+	driver.Conn
+	host string
+}
+
+// promotedClusterStrategy models the state right after a switchover: the cached
+// hosts belong to the demoted region and never report a writer, while the
+// initial host now resolves to the promoted cluster and does.
+type promotedClusterStrategy struct {
+	initialHost string
+	staleHosts  []*host_info_util.HostInfo
+	newHosts    []*host_info_util.HostInfo
+}
+
+func (s *promotedClusterStrategy) isInitialHost(conn driver.Conn) bool {
+	identified, ok := conn.(*identifiedConn)
+	return ok && identified.host == s.initialHost
+}
+
+func (s *promotedClusterStrategy) QueryForTopology(conn driver.Conn) ([]*host_info_util.HostInfo, error) {
+	if s.isInitialHost(conn) {
+		return s.newHosts, nil
+	}
+	return s.staleHosts, nil
+}
+
+func (s *promotedClusterStrategy) GetInstanceTemplate(string, driver.Conn) (*host_info_util.HostInfo, error) {
+	return nil, nil
+}
+
+func (s *promotedClusterStrategy) IsWriterInstance(conn driver.Conn) (bool, error) {
+	return s.isInitialHost(conn), nil
+}
+
+func (s *promotedClusterStrategy) GetInstanceId(conn driver.Conn) (string, string) {
+	if s.isInitialHost(conn) {
+		return s.newHosts[0].HostId, s.newHosts[0].GetHost()
+	}
+	return "", ""
+}
+
+func (s *promotedClusterStrategy) CreateHost(
+	_, _ string, _ bool, _ int, _ time.Time, initialHost, _ *host_info_util.HostInfo,
+) *host_info_util.HostInfo {
+	return initialHost
+}
+
+// TestClusterTopologyMonitorRecoversPromotedClusterWhenStalled is the end of the
+// story the previous test starts. It is not enough that the monitor re-consults
+// the initial host: that connection must verify a writer, leave panic mode, and
+// replace the stale cache with the promoted cluster's topology. Without the
+// recheck the monitor never reaches the promoted cluster at all.
+func TestClusterTopologyMonitorRecoversPromotedClusterWhenStalled(t *testing.T) {
+	originalInterval := driver_infrastructure.InitialHostRecheckIntervalNano
+	driver_infrastructure.InitialHostRecheckIntervalNano = 100 * time.Millisecond
+	defer func() { driver_infrastructure.InitialHostRecheckIntervalNano = originalInterval }()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	initialHostInfo := staleHost(t, "cluster.global-ghi.global.rds.amazonaws.com")
+	staleHosts := []*host_info_util.HostInfo{
+		staleHost(t, "old-region-instance-0.ghi.us-east-1.rds.amazonaws.com"),
+		staleHost(t, "old-region-instance-1.ghi.us-east-1.rds.amazonaws.com"),
+	}
+	promotedHost := staleHost(t, "new-region-instance-0.jkl.us-west-2.rds.amazonaws.com")
+
+	mockDialect := mock_driver_infrastructure.NewMockDriverDialect(ctrl)
+	mockDialect.EXPECT().IsClosed(gomock.Any()).Return(false).AnyTimes()
+
+	mockPluginService := mock_driver_infrastructure.NewMockPluginService(ctrl)
+	mockPluginService.EXPECT().GetTargetDriverDialect().Return(mockDialect).AnyTimes()
+	mockPluginService.EXPECT().IsNetworkError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().IsLoginError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().SetAvailability(gomock.Any(), gomock.Any()).AnyTimes()
+	mockPluginService.EXPECT().GetHostRole(gomock.Any()).Return(host_info_util.READER).AnyTimes()
+	mockPluginService.EXPECT().
+		ForceConnect(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(hostInfo *host_info_util.HostInfo, _ *utils.RWMap[string, string]) (driver.Conn, error) {
+			return &identifiedConn{Conn: &MockConn{}, host: hostInfo.GetHost()}, nil
+		}).
+		AnyTimes()
+
+	publisher := services.NewEventPublisher()
+	storage := services.NewExpiringStorage(time.Minute, publisher)
+	container := &services.FullServicesContainer{Storage: storage, Events: publisher}
+
+	driver_infrastructure.TopologyStorageType.Register(storage)
+	driver_infrastructure.TopologyStorageType.Set(
+		storage, staleTopologyClusterId, driver_infrastructure.NewTopology(staleHosts))
+
+	seeded, found := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+	require.True(t, found)
+	require.Len(t, seeded.GetHosts(), len(staleHosts))
+
+	monitor := driver_infrastructure.NewClusterTopologyMonitorImpl(
+		container,
+		staleTopologyClusterId,
+		10*time.Millisecond,
+		10*time.Millisecond,
+		time.Minute,
+		utils.NewRWMap[string, string](),
+		initialHostInfo,
+		initialHostInfo,
+		mockPluginService,
+		&promotedClusterStrategy{
+			initialHost: initialHostInfo.GetHost(),
+			staleHosts:  staleHosts,
+			newHosts:    []*host_info_util.HostInfo{promotedHost},
+		},
+	)
+
+	monitor.Start()
+	defer monitor.Stop()
+
+	assert.Eventually(t, func() bool {
+		topology, ok := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+		if !ok {
+			return false
+		}
+		for _, h := range topology.GetHosts() {
+			if h.GetHost() == promotedHost.GetHost() {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond,
+		"cache still holds the demoted region's topology; the monitor never picked up the promoted cluster")
+
+	// Leaving panic mode is what makes waitForTopologyUpdate stop timing out,
+	// which is the failure operators actually see.
+	hosts, err := monitor.ForceRefresh(false, 1000)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, hosts)
+}
