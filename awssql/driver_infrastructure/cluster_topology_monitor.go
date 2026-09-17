@@ -247,7 +247,7 @@ func (c *ClusterTopologyMonitorImpl) Monitor() {
 			c.checkForStableReaderTopologies()
 			c.recheckInitialHostIfStalled()
 			c.delay(true)
-		} else {
+		} else { // not c.isInPanicMode
 			// Regular mode (not panic mode).
 			c.panicModeStart.Store(0)
 			c.lastInitialHostRecheck.Store(0)
