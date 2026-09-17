@@ -173,24 +173,77 @@ func (c *ClusterTopologyMonitorImpl) Monitor() {
 	for !c.stop.Load() {
 		c.lastActivityTimestampNano.Store(time.Now().UnixNano())
 		if c.isInPanicMode() {
-			if utils.LengthOfSyncMap(c.hostRoutines) == 0 {
-				slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.startingHostMonitoringRoutines"))
+			c.handlePanicMode()
+		} else {
+			c.handleRegularMode()
+		}
+	}
+	c.state.Store(MonitorStateStopped)
+}
 
-				// Start host routines
-				c.hostRoutinesStop.Store(false)
-				c.hostRoutinesWriterConn.Store(emptyContainer)
-				c.hostRoutinesReaderConn.Store(emptyContainer)
-				c.hostRoutinesWriterHostInfo.Store(nil)
-				c.hostRoutinesLatestTopology.Store([]*host_info_util.HostInfo{})
+// handlePanicMode runs one iteration of the monitor loop while no writer connection
+// is verified: it starts or updates the host monitoring routines, adopts a writer as
+// soon as one is found, and otherwise rechecks stable reader topologies and the
+// stalled initial host before delaying.
+func (c *ClusterTopologyMonitorImpl) handlePanicMode() {
+	if utils.LengthOfSyncMap(c.hostRoutines) == 0 {
+		slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.startingHostMonitoringRoutines"))
 
-				hosts := c.getStoredHosts()
-				if len(hosts) == 0 {
-					// Need any connection to get topology.
-					hosts, _ = c.openAnyConnectionAndUpdateTopology()
+		// Start host routines
+		c.hostRoutinesStop.Store(false)
+		c.hostRoutinesWriterConn.Store(emptyContainer)
+		c.hostRoutinesReaderConn.Store(emptyContainer)
+		c.hostRoutinesWriterHostInfo.Store(nil)
+		c.hostRoutinesLatestTopology.Store([]*host_info_util.HostInfo{})
+
+		hosts := c.getStoredHosts()
+		if len(hosts) == 0 {
+			// Need any connection to get topology.
+			hosts, _ = c.openAnyConnectionAndUpdateTopology()
+		}
+
+		if len(hosts) != 0 && !c.isVerifiedWriterConn.Load() {
+			for _, hostInfo := range hosts {
+				hostMonitor := &HostMonitoringRoutine{
+					monitor:        c,
+					hostInfo:       hostInfo,
+					writerHostInfo: c.writerHostInfo.Load(),
 				}
+				hostMonitor.Init()
+				c.hostRoutinesWg.Add(1)
+				c.hostRoutines.Store(hostInfo.Host, hostMonitor)
+			}
+		}
 
-				if len(hosts) != 0 && !c.isVerifiedWriterConn.Load() {
-					for _, hostInfo := range hosts {
+		// Otherwise let's try it again the next round.
+	} else {
+		// Host routines are running.
+		// Check if writer is already detected.
+		writerConn := c.loadConn(c.hostRoutinesWriterConn)
+		writerConnHostInfo := c.hostRoutinesWriterHostInfo.Load()
+
+		if writerConn != nil && !writerConnHostInfo.IsNil() {
+			slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.writerPickedUpFromHostMonitors", writerConnHostInfo.String()))
+			c.closeConnection(c.loadConn(c.monitoringConn))
+			c.monitoringConn.Store(ConnectionContainer{writerConn})
+			c.writerHostInfo.Store(writerConnHostInfo)
+			c.isVerifiedWriterConn.Store(true)
+			c.highRefreshRateEndTimeInNanos = time.Now().Add(highRefreshPeriodAfterPanicNano).Unix()
+
+			c.hostRoutinesStop.Store(true)
+			c.hostRoutinesWg.Wait()
+			c.hostRoutines.Clear()
+			c.stableTopologiesStart.Store(0)
+			c.readerTopologiesById.Clear()
+			c.completedOneCycle.Clear()
+			return
+		} else {
+			// Update host routines with new hosts in the topology.
+			hosts, ok := c.hostRoutinesLatestTopology.Load().([]*host_info_util.HostInfo)
+			if ok && len(hosts) > 0 && !c.hostRoutinesStop.Load() {
+				for _, hostInfo := range hosts {
+					_, foundHostRoutine := c.hostRoutines.Load(hostInfo.Host)
+					if !foundHostRoutine {
 						hostMonitor := &HostMonitoringRoutine{
 							monitor:        c,
 							hostInfo:       hostInfo,
@@ -201,104 +254,68 @@ func (c *ClusterTopologyMonitorImpl) Monitor() {
 						c.hostRoutines.Store(hostInfo.Host, hostMonitor)
 					}
 				}
-
-				// Otherwise let's try it again the next round.
-			} else {
-				// Host routines are running.
-				// Check if writer is already detected.
-				writerConn := c.loadConn(c.hostRoutinesWriterConn)
-				writerConnHostInfo := c.hostRoutinesWriterHostInfo.Load()
-
-				if writerConn != nil && !writerConnHostInfo.IsNil() {
-					slog.Debug(error_util.GetMessage("ClusterTopologyMonitorImpl.writerPickedUpFromHostMonitors", writerConnHostInfo.String()))
-					c.closeConnection(c.loadConn(c.monitoringConn))
-					c.monitoringConn.Store(ConnectionContainer{writerConn})
-					c.writerHostInfo.Store(writerConnHostInfo)
-					c.isVerifiedWriterConn.Store(true)
-					c.highRefreshRateEndTimeInNanos = time.Now().Add(highRefreshPeriodAfterPanicNano).Unix()
-
-					c.hostRoutinesStop.Store(true)
-					c.hostRoutinesWg.Wait()
-					c.hostRoutines.Clear()
-					c.stableTopologiesStart.Store(0)
-					c.readerTopologiesById.Clear()
-					c.completedOneCycle.Clear()
-					continue
-				} else {
-					// Update host routines with new hosts in the topology.
-					hosts, ok := c.hostRoutinesLatestTopology.Load().([]*host_info_util.HostInfo)
-					if ok && len(hosts) > 0 && !c.hostRoutinesStop.Load() {
-						for _, hostInfo := range hosts {
-							_, foundHostRoutine := c.hostRoutines.Load(hostInfo.Host)
-							if !foundHostRoutine {
-								hostMonitor := &HostMonitoringRoutine{
-									monitor:        c,
-									hostInfo:       hostInfo,
-									writerHostInfo: c.writerHostInfo.Load(),
-								}
-								hostMonitor.Init()
-								c.hostRoutinesWg.Add(1)
-								c.hostRoutines.Store(hostInfo.Host, hostMonitor)
-							}
-						}
-					}
-				}
 			}
-			c.checkForStableReaderTopologies()
-			c.recheckInitialHostIfStalled()
-			c.delay(true)
-		} else { // not c.isInPanicMode
-			// Regular mode (not panic mode).
-			c.panicModeStart.Store(0)
-			c.lastInitialHostRecheck.Store(0)
-
-			if utils.LengthOfSyncMap(c.hostRoutines) != 0 {
-				c.hostRoutinesStop.Store(true)
-				c.hostRoutinesWg.Wait()
-				// A stall recheck can verify a writer on its own connection and leave
-				// panic mode without the adoption block at :209-226, the only place
-				// that takes ownership of a writer connection a host routine published
-				// into hostRoutinesWriterConn. The routines are stopped and waited for
-				// just above, so nothing can publish another; close the orphaned
-				// connection here (unless it was already adopted as the monitoring
-				// connection) rather than leaking it or overwriting it at :181.
-				if wc := c.loadConn(c.hostRoutinesWriterConn); wc != nil && wc != c.loadConn(c.monitoringConn) {
-					c.closeConnection(wc)
-				}
-				c.hostRoutinesWriterConn.Store(emptyContainer)
-				c.hostRoutinesWriterHostInfo.Store(nil)
-				c.hostRoutines.Clear()
-				c.stableTopologiesStart.Store(0)
-				c.readerTopologiesById.Clear()
-				c.completedOneCycle.Clear()
-			}
-
-			hosts := c.fetchTopologyAndUpdateCache(c.loadConn(c.monitoringConn))
-			if len(hosts) == 0 {
-				// Can't get topology, switch to panic mode.
-				c.closeConnection(c.loadConn(c.monitoringConn))
-				c.monitoringConn.Store(emptyContainer)
-				c.isVerifiedWriterConn.Store(false)
-				c.writerHostInfo.Store(nil)
-				continue
-			}
-
-			if c.highRefreshRateEndTimeInNanos > 0 && time.Now().Unix() > c.highRefreshRateEndTimeInNanos {
-				c.highRefreshRateEndTimeInNanos = 0
-			}
-
-			// Do not log topology while in high refresh rate.
-			if c.highRefreshRateEndTimeInNanos == 0 {
-				hosts := c.getStoredHosts()
-				if hosts != nil {
-					slog.Debug(utils.LogTopology(hosts, ""))
-				}
-			}
-
-			c.delay(false)
 		}
 	}
-	c.state.Store(MonitorStateStopped)
+	c.checkForStableReaderTopologies()
+	c.recheckInitialHostIfStalled()
+	c.delay(true)
+}
+
+// handleRegularMode runs one iteration of the monitor loop while a writer connection
+// is verified: it tears down any lingering host routines, refreshes the cached
+// topology from the monitoring connection, and returns to panic mode if the topology
+// can no longer be fetched.
+func (c *ClusterTopologyMonitorImpl) handleRegularMode() {
+	// Regular mode (not panic mode).
+	c.panicModeStart.Store(0)
+	c.lastInitialHostRecheck.Store(0)
+
+	if utils.LengthOfSyncMap(c.hostRoutines) != 0 {
+		c.hostRoutinesStop.Store(true)
+		c.hostRoutinesWg.Wait()
+		// A stall recheck can verify a writer on its own connection and leave
+		// panic mode without the adoption block in handlePanicMode, the only place
+		// that takes ownership of a writer connection a host routine published
+		// into hostRoutinesWriterConn. The routines are stopped and waited for
+		// just above, so nothing can publish another; close the orphaned
+		// connection here (unless it was already adopted as the monitoring
+		// connection) rather than leaking it or letting the next panic-mode
+		// restart overwrite it.
+		if wc := c.loadConn(c.hostRoutinesWriterConn); wc != nil && wc != c.loadConn(c.monitoringConn) {
+			c.closeConnection(wc)
+		}
+		c.hostRoutinesWriterConn.Store(emptyContainer)
+		c.hostRoutinesWriterHostInfo.Store(nil)
+		c.hostRoutines.Clear()
+		c.stableTopologiesStart.Store(0)
+		c.readerTopologiesById.Clear()
+		c.completedOneCycle.Clear()
+	}
+
+	hosts := c.fetchTopologyAndUpdateCache(c.loadConn(c.monitoringConn))
+	if len(hosts) == 0 {
+		// Can't get topology, switch to panic mode.
+		c.closeConnection(c.loadConn(c.monitoringConn))
+		c.monitoringConn.Store(emptyContainer)
+		c.isVerifiedWriterConn.Store(false)
+		c.writerHostInfo.Store(nil)
+		return
+	}
+
+	if c.highRefreshRateEndTimeInNanos > 0 && time.Now().Unix() > c.highRefreshRateEndTimeInNanos {
+		c.highRefreshRateEndTimeInNanos = 0
+	}
+
+	// Do not log topology while in high refresh rate.
+	if c.highRefreshRateEndTimeInNanos == 0 {
+		hosts := c.getStoredHosts()
+		if hosts != nil {
+			slog.Debug(utils.LogTopology(hosts, ""))
+		}
+	}
+
+	c.delay(false)
 }
 
 func (c *ClusterTopologyMonitorImpl) Stop() {
