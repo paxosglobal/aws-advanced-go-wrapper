@@ -18,6 +18,7 @@ package test
 
 import (
 	"database/sql/driver"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -539,4 +540,234 @@ func TestClusterTopologyMonitorRechecksInitialHostWhileHoldingNonWriterConn(t *t
 		return false
 	}, 5*time.Second, 20*time.Millisecond,
 		"monitor kept re-querying the connection it already held to the demoted region and never re-consulted the initial host")
+}
+
+// trackedConn records whether a connection was ever closed, so a test can assert
+// that the monitor did not drop one on the floor. identifiedConn cannot be reused
+// for this: MockConn.closeCounter is a plain int written from whichever goroutine
+// closes, which the race detector rejects.
+type trackedConn struct {
+	driver.Conn
+	host   string
+	closed atomic.Bool
+}
+
+func (c *trackedConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// racingWriterStrategy models a host monitoring routine that finds a writer at the
+// same moment the stalled monitor re-consults the initial host.
+//
+// A demoted instance can still answer as the writer for a short window after a
+// switchover, so a host routine can reach the hand-off at cluster_topology_monitor.go:896-917:
+// it publishes its connection into hostRoutinesWriterConn, sets its own local conn
+// to nil so the deferred close skips it, and returns. Ownership has moved to the
+// monitor at that point.
+//
+// The routine publishes the connection BEFORE it publishes the host info, with a
+// topology query in between. Blocking that query holds the routine in exactly that
+// window, which is what makes this test deterministic rather than a race to lose.
+type racingWriterStrategy struct {
+	initialHost     string
+	staleWriterHost string
+	staleHosts      []*host_info_util.HostInfo
+	newHosts        []*host_info_util.HostInfo
+	gate            chan struct{}
+}
+
+func (s *racingWriterStrategy) hostOf(conn driver.Conn) string {
+	tracked, ok := conn.(*trackedConn)
+	if !ok {
+		return ""
+	}
+	return tracked.host
+}
+
+func (s *racingWriterStrategy) QueryForTopology(conn driver.Conn) ([]*host_info_util.HostInfo, error) {
+	switch s.hostOf(conn) {
+	case s.initialHost:
+		return s.newHosts, nil
+	case s.staleWriterHost:
+		// Hold the routine between publishing its connection and publishing its
+		// host info, so the monitor cannot adopt it the ordinary way.
+		<-s.gate
+		return s.staleHosts, nil
+	default:
+		return s.staleHosts, nil
+	}
+}
+
+func (s *racingWriterStrategy) GetInstanceTemplate(string, driver.Conn) (*host_info_util.HostInfo, error) {
+	return nil, nil
+}
+
+func (s *racingWriterStrategy) IsWriterInstance(conn driver.Conn) (bool, error) {
+	host := s.hostOf(conn)
+	return host == s.initialHost || host == s.staleWriterHost, nil
+}
+
+func (s *racingWriterStrategy) GetInstanceId(conn driver.Conn) (string, string) {
+	if s.hostOf(conn) == s.initialHost {
+		return s.newHosts[0].HostId, s.newHosts[0].GetHost()
+	}
+	return "", ""
+}
+
+func (s *racingWriterStrategy) CreateHost(
+	_, _ string, _ bool, _ int, _ time.Time, initialHost, _ *host_info_util.HostInfo,
+) *host_info_util.HostInfo {
+	return initialHost
+}
+
+// TestClusterTopologyMonitorDoesNotLeakHostRoutineWriterConn covers the ownership
+// hand-off that the stall recheck opened up.
+//
+// Before the recheck existed, a monitor with host routines running could only leave
+// panic mode through the adoption block at cluster_topology_monitor.go:209-226, which
+// takes ownership of whatever the routines published — openAnyConnectionAndUpdateTopology
+// was reachable only at :189, with no routines running. The regular-mode cleanup at
+// :255-262 relies on that: it stops, waits for and clears the routines without ever
+// closing hostRoutinesWriterConn, because by then the connection is supposed to be the
+// monitoring connection.
+//
+// The recheck adds a second exit that does not adopt, so the cleanup can now run while
+// a routine's published writer connection is still sitting there unowned. Nothing closes
+// it: the routine set its local conn to nil, Close() at :309-319 only closes the
+// monitoring connection, and re-entering panic mode overwrites the container at :181.
+func TestClusterTopologyMonitorDoesNotLeakHostRoutineWriterConn(t *testing.T) {
+	originalInterval := driver_infrastructure.InitialHostRecheckIntervalNano
+	driver_infrastructure.InitialHostRecheckIntervalNano = 100 * time.Millisecond
+	defer func() { driver_infrastructure.InitialHostRecheckIntervalNano = originalInterval }()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	initialHostInfo := staleHost(t, "cluster.global-mno.global.rds.amazonaws.com")
+	staleWriter := staleHost(t, "old-region-instance-0.mno.us-east-1.rds.amazonaws.com")
+	staleHosts := []*host_info_util.HostInfo{
+		staleWriter,
+		staleHost(t, "old-region-instance-1.mno.us-east-1.rds.amazonaws.com"),
+	}
+	promotedHost := staleHost(t, "new-region-instance-0.pqr.us-west-2.rds.amazonaws.com")
+
+	strategy := &racingWriterStrategy{
+		initialHost:     initialHostInfo.GetHost(),
+		staleWriterHost: staleWriter.GetHost(),
+		staleHosts:      staleHosts,
+		newHosts:        []*host_info_util.HostInfo{promotedHost},
+		gate:            make(chan struct{}),
+	}
+	var gateOnce sync.Once
+	releaseGate := func() { gateOnce.Do(func() { close(strategy.gate) }) }
+
+	var connMu sync.Mutex
+	var publishedWriterConn *trackedConn
+
+	mockDialect := mock_driver_infrastructure.NewMockDriverDialect(ctrl)
+	mockDialect.EXPECT().IsClosed(gomock.Any()).Return(false).AnyTimes()
+
+	mockPluginService := mock_driver_infrastructure.NewMockPluginService(ctrl)
+	mockPluginService.EXPECT().GetTargetDriverDialect().Return(mockDialect).AnyTimes()
+	mockPluginService.EXPECT().IsNetworkError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().IsLoginError(gomock.Any()).Return(false).AnyTimes()
+	mockPluginService.EXPECT().SetAvailability(gomock.Any(), gomock.Any()).AnyTimes()
+	// The routine double-checks writer-ness through GetHostRole, so the demoted
+	// instance has to answer WRITER there too to reach the hand-off.
+	mockPluginService.EXPECT().
+		GetHostRole(gomock.Any()).
+		DoAndReturn(func(conn driver.Conn) host_info_util.HostRole {
+			if tracked, ok := conn.(*trackedConn); ok && tracked.host == staleWriter.GetHost() {
+				return host_info_util.WRITER
+			}
+			return host_info_util.READER
+		}).
+		AnyTimes()
+	mockPluginService.EXPECT().
+		ForceConnect(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(hostInfo *host_info_util.HostInfo, _ *utils.RWMap[string, string]) (driver.Conn, error) {
+			conn := &trackedConn{Conn: &MockConn{}, host: hostInfo.GetHost()}
+			if hostInfo.GetHost() == staleWriter.GetHost() {
+				connMu.Lock()
+				if publishedWriterConn == nil {
+					publishedWriterConn = conn
+				}
+				connMu.Unlock()
+			}
+			return conn, nil
+		}).
+		AnyTimes()
+
+	publisher := services.NewEventPublisher()
+	storage := services.NewExpiringStorage(time.Minute, publisher)
+	container := &services.FullServicesContainer{Storage: storage, Events: publisher}
+
+	driver_infrastructure.TopologyStorageType.Register(storage)
+	driver_infrastructure.TopologyStorageType.Set(
+		storage, staleTopologyClusterId, driver_infrastructure.NewTopology(staleHosts))
+
+	seeded, found := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+	require.True(t, found)
+	require.Len(t, seeded.GetHosts(), len(staleHosts))
+
+	monitor := driver_infrastructure.NewClusterTopologyMonitorImpl(
+		container,
+		staleTopologyClusterId,
+		10*time.Millisecond,
+		10*time.Millisecond,
+		time.Minute,
+		utils.NewRWMap[string, string](),
+		initialHostInfo,
+		initialHostInfo,
+		mockPluginService,
+		strategy,
+	)
+
+	monitor.Start()
+	defer monitor.Stop()
+
+	// Release the gate however the test exits, so a failed assertion cannot wedge
+	// the run. This has to be registered AFTER monitor.Stop() so that it runs
+	// BEFORE it: deferred calls run last-in-first-out, and Stop() ends in Close(),
+	// which waits on the host routines. Releasing the gate afterwards would be too
+	// late — the blocked routine could never finish and the wait would never return.
+	defer releaseGate()
+
+	// The routine has to have reached the hand-off before any of this means
+	// anything, otherwise the test would pass without exercising the window.
+	require.Eventually(t, func() bool {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return publishedWriterConn != nil
+	}, 5*time.Second, 10*time.Millisecond,
+		"no host routine ever connected to the demoted instance that reports as writer")
+
+	// The monitor leaves panic mode through the recheck while that routine is still
+	// held at the gate, so the ordinary adoption at :212 never sees a host info.
+	require.Eventually(t, func() bool {
+		topology, ok := driver_infrastructure.TopologyStorageType.Get(storage, staleTopologyClusterId)
+		if !ok {
+			return false
+		}
+		for _, h := range topology.GetHosts() {
+			if h.GetHost() == promotedHost.GetHost() {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond,
+		"monitor never recovered the promoted cluster, so the ownership window was never reached")
+
+	// Let the routine finish and hand its connection over.
+	releaseGate()
+
+	connMu.Lock()
+	leaked := publishedWriterConn
+	connMu.Unlock()
+
+	assert.Eventually(t, leaked.closed.Load, 5*time.Second, 20*time.Millisecond,
+		"the writer connection a host routine published was never closed: the routine gave up "+
+			"ownership, the monitor left panic mode without adopting it, and the regular-mode "+
+			"cleanup cleared the routines without closing it")
 }

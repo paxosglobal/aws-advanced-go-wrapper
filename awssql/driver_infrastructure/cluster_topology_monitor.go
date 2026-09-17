@@ -255,6 +255,18 @@ func (c *ClusterTopologyMonitorImpl) Monitor() {
 			if utils.LengthOfSyncMap(c.hostRoutines) != 0 {
 				c.hostRoutinesStop.Store(true)
 				c.hostRoutinesWg.Wait()
+				// A stall recheck can verify a writer on its own connection and leave
+				// panic mode without the adoption block at :209-226, the only place
+				// that takes ownership of a writer connection a host routine published
+				// into hostRoutinesWriterConn. The routines are stopped and waited for
+				// just above, so nothing can publish another; close the orphaned
+				// connection here (unless it was already adopted as the monitoring
+				// connection) rather than leaking it or overwriting it at :181.
+				if wc := c.loadConn(c.hostRoutinesWriterConn); wc != nil && wc != c.loadConn(c.monitoringConn) {
+					c.closeConnection(wc)
+				}
+				c.hostRoutinesWriterConn.Store(emptyContainer)
+				c.hostRoutinesWriterHostInfo.Store(nil)
 				c.hostRoutines.Clear()
 				c.stableTopologiesStart.Store(0)
 				c.readerTopologiesById.Clear()
