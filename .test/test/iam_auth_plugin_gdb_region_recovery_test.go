@@ -75,7 +75,7 @@ func connectLoginError(_ *utils.RWMap[string, string]) (driver.Conn, error) {
 	return nil, mysqlLoginError
 }
 
-func TestIamAuthPluginGdbRegionPanicReleasesWaiters(t *testing.T) {
+func TestIamAuthPluginGdbRegionPanicBecomesLookupError(t *testing.T) {
 	useDiscardLogger(t)
 	synctest.Test(t, func(t *testing.T) {
 		tokens := &regionRecordingTokenUtility{}
@@ -90,37 +90,33 @@ func TestIamAuthPluginGdbRegionPanicReleasesWaiters(t *testing.T) {
 		})
 
 		var wg sync.WaitGroup
-		var leaderPanicked atomic.Bool
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() { leaderPanicked.Store(recover() != nil) }()
-			_, _ = plugin.Connect(gdbHostInfo(t), gdbProps(), false, connectOK)
-		}()
+		errs := make([]error, 2)
+		for i := range errs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[i] = plugin.Connect(gdbHostInfo(t), gdbProps(), false, connectOK)
+			}()
+		}
 		synctest.Wait()
-
-		var waiterErr error
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, waiterErr = plugin.Connect(gdbHostInfo(t), gdbProps(), false, connectOK)
-		}()
-		synctest.Wait()
-
 		close(release)
 		wg.Wait()
 
-		assert.True(t, leaderPanicked.Load(), "the panic still reaches the caller that ran the lookup")
-		require.Error(t, waiterErr)
-		assert.Contains(t, waiterErr.Error(), "did not complete")
-
+		for _, err := range errs {
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "did not complete: provider failed")
+		}
 		_, err := plugin.Connect(gdbHostInfo(t), gdbProps(), false, connectOK)
 		require.NoError(t, err, "a later connection starts a new lookup")
 		assert.Equal(t, int32(2), provider.calls.Load())
 	})
 }
 
-func TestIamAuthPluginGdbRegionEmptyRegionIsAnError(t *testing.T) {
+// The lookup's own empty-region check is what keeps the retry path from signing
+// a token for an empty region; TestIamAuthPluginGdbRegionEmptyRefreshKeepsLoginError
+// covers it. This test covers the first connection, which an older check in
+// connectInternal also rejects.
+func TestIamAuthPluginGdbRegionEmptyRegionFailsConnect(t *testing.T) {
 	tokens := &regionRecordingTokenUtility{}
 	plugin := newGdbIamPlugin(t, tokens)
 	provider := useScriptedGdbRegionProvider(t, func(int32) (region_util.Region, error) { return "", nil })

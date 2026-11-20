@@ -123,13 +123,12 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 	// because a switchover can move the writer to another region.
 	resolvesGdbRegion := utils.IsGlobalDbWriterClusterDns(host) &&
 		region_util.GetRegionFromProps(props, property_util.IAM_REGION) == ""
-	gdbRegionExpiration := time.Duration(property_util.GetExpirationValue(props, property_util.IAM_EXPIRATION_SEC)) * time.Second
 
 	var region region_util.Region
 	var regionFromCache bool
 	var regionErr error
 	if resolvesGdbRegion {
-		region, regionFromCache, regionErr = getGdbRegion(host, props, gdbRegionExpiration)
+		region, regionFromCache, regionErr = getGdbRegion(host, props)
 		if regionFromCache {
 			slog.Debug(error_util.GetMessage("IamAuthPlugin.useCachedRegion", region, host))
 		}
@@ -172,7 +171,7 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 	// only if the region changed or the token was cached. Any other failure
 	// returns the original login error.
 	if regionFromCache {
-		refreshedRegion, refreshErr := refreshGdbRegion(host, props, gdbRegionExpiration, region)
+		refreshedRegion, refreshErr := refreshGdbRegion(host, props, region)
 		if refreshErr != nil {
 			slog.Warn(error_util.GetMessage("IamAuthPlugin.gdbRegionRefreshError", host, refreshErr))
 			return nil, err
