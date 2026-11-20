@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"regexp"
+	"time"
 
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/error_util"
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/property_util"
@@ -51,7 +52,23 @@ func NewGdbRegionProvider(credentialsProvider aws.CredentialsProvider) *GdbRegio
 	}
 }
 
+// GdbRegionLookupTimeout bounds one rds:DescribeGlobalClusters call, including
+// the credential retrieval it triggers. Without it, a hung call blocked every
+// connection waiting for the writer region.
+var GdbRegionLookupTimeout = 10 * time.Second
+
+// NewRdsClient creates the RDS client that resolves a global cluster's writer.
+// Tests replace it.
+var NewRdsClient = newRdsClient
+
 func defaultRdsClientProvider(credentialsProvider aws.CredentialsProvider) RdsDescribeGlobalClustersClient {
+	if client := sharedRdsClient(credentialsProvider); client != nil {
+		return client
+	}
+	return NewRdsClient(credentialsProvider)
+}
+
+func newRdsClient(credentialsProvider aws.CredentialsProvider) RdsDescribeGlobalClustersClient {
 	var opts []func(*config.LoadOptions) error
 	if credentialsProvider != nil {
 		opts = append(opts, config.WithCredentialsProvider(credentialsProvider))
@@ -98,7 +115,9 @@ func (g *GdbRegionProvider) GetRegion(host string, props *utils.RWMap[string, st
 func (g *GdbRegionProvider) findWriterClusterArn(globalClusterIdentifier string) (string, error) {
 	client := g.RdsClientProvider(g.CredentialsProvider)
 
-	output, err := client.DescribeGlobalClusters(context.TODO(), &rds.DescribeGlobalClustersInput{
+	ctx, cancel := context.WithTimeout(context.Background(), GdbRegionLookupTimeout)
+	defer cancel()
+	output, err := client.DescribeGlobalClusters(ctx, &rds.DescribeGlobalClustersInput{
 		GlobalClusterIdentifier: &globalClusterIdentifier,
 	})
 	if err != nil {

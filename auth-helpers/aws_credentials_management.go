@@ -19,6 +19,7 @@ package auth_helpers
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/host_info_util"
 	"github.com/aws/aws-advanced-go-wrapper/awssql/v2/property_util"
@@ -49,11 +50,75 @@ func SetAwsCredentialsProviderHandler(credentialsHandler AwsCredentialsProviderH
 	awsCredentialsProviderHandler = credentialsHandler
 }
 
+type defaultCredentials struct {
+	provider  aws.CredentialsProvider
+	rdsClient RdsDescribeGlobalClustersClient
+	createdAt time.Time
+}
+
+var defaultProviders = map[string]*defaultCredentials{}
+
+var defaultProvidersLock sync.Mutex
+
+// DefaultCredentialsProviderLifetime is how long getDefaultProvider shares one
+// provider before it loads the default configuration again, so rotated keys in
+// a credentials file or the environment are picked up.
+var DefaultCredentialsProviderLifetime = 15 * time.Minute
+
+// DefaultCredentialsExpiryWindow makes a shared provider renew temporary
+// credentials this long before they expire. It must be longer than the IAM
+// token lifetime (iamExpirationSec, 870s by default): RDS requires the
+// credentials that signed a token to be valid when the token is used.
+var DefaultCredentialsExpiryWindow = 15 * time.Minute
+
+// getDefaultProvider returns a provider per profile that is shared for
+// DefaultCredentialsProviderLifetime. LoadDefaultConfig wraps the provider in an
+// aws.CredentialsCache, so a shared provider reuses credentials until they are
+// within DefaultCredentialsExpiryWindow of expiring. With a new provider per
+// call, each IAM connection fetched new credentials (an STS call under IRSA).
 func getDefaultProvider(profile string) (aws.CredentialsProvider, error) {
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	if entry, ok := defaultProviders[profile]; ok && time.Since(entry.createdAt) < DefaultCredentialsProviderLifetime {
+		return entry.provider, nil
+	}
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithSharedConfigProfile(profile))
+		config.WithSharedConfigProfile(profile),
+		config.WithCredentialsCacheOptions(func(o *aws.CredentialsCacheOptions) {
+			o.ExpiryWindow = DefaultCredentialsExpiryWindow
+		}))
 	if err != nil {
 		return nil, err
 	}
+	defaultProviders[profile] = &defaultCredentials{provider: cfg.Credentials, createdAt: time.Now()}
 	return cfg.Credentials, nil
+}
+
+// sharedRdsClient returns one RDS client per provider that getDefaultProvider
+// shares, and nil for any other provider. Only *aws.CredentialsCache values are
+// compared, so a provider of a type that is not comparable cannot panic here.
+func sharedRdsClient(credentialsProvider aws.CredentialsProvider) RdsDescribeGlobalClustersClient {
+	cache, ok := credentialsProvider.(*aws.CredentialsCache)
+	if !ok || cache == nil {
+		return nil
+	}
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	for _, entry := range defaultProviders {
+		if shared, ok := entry.provider.(*aws.CredentialsCache); ok && shared == cache {
+			if entry.rdsClient == nil {
+				entry.rdsClient = NewRdsClient(credentialsProvider)
+			}
+			return entry.rdsClient
+		}
+	}
+	return nil
+}
+
+// ClearDefaultCredentialsProviders drops the providers and RDS clients that
+// getDefaultProvider and sharedRdsClient share.
+func ClearDefaultCredentialsProviders() {
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	defaultProviders = map[string]*defaultCredentials{}
 }

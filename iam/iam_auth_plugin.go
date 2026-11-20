@@ -49,6 +49,7 @@ func (factory IamAuthPluginFactory) GetInstance(servicesContainer driver_infrast
 
 func (factory IamAuthPluginFactory) ClearCaches() {
 	TokenCache.Clear()
+	clearGdbRegionCache()
 }
 
 func NewIamAuthPluginFactory() driver_infrastructure.ConnectionPluginFactory {
@@ -117,13 +118,23 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 		property_util.GetVerifiedWrapperPropertyValue[int](props, property_util.IAM_DEFAULT_PORT),
 		*hostInfo, iamAuthPlugin.servicesContainer.GetPluginService().GetDialect().GetDefaultPort())
 
-	var regionProvider region_util.RegionProvider
-	if utils.IsGlobalDbWriterClusterDns(host) {
-		regionProvider = auth_helpers.NewGdbRegionProvider(nil)
+	// The region of a global writer endpoint is the current writer's region. It is
+	// cached as long as a token is, and resolved again when a login with it fails,
+	// because a switchover can move the writer to another region.
+	resolvesGdbRegion := utils.IsGlobalDbWriterClusterDns(host) &&
+		region_util.GetRegionFromProps(props, property_util.IAM_REGION) == ""
+
+	var region region_util.Region
+	var regionFromCache bool
+	var regionErr error
+	if resolvesGdbRegion {
+		region, regionFromCache, regionErr = getGdbRegion(host, props)
+		if regionFromCache {
+			slog.Debug(error_util.GetMessage("IamAuthPlugin.useCachedRegion", region, host))
+		}
 	} else {
-		regionProvider = &region_util.DefaultRegionProvider{}
+		region, regionErr = (&region_util.DefaultRegionProvider{}).GetRegion(host, props, property_util.IAM_REGION)
 	}
-	region, regionErr := regionProvider.GetRegion(host, props, property_util.IAM_REGION)
 	if regionErr != nil {
 		return nil, regionErr
 	}
@@ -131,12 +142,8 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 		return nil, errors.New(error_util.GetMessage("IamAuthPlugin.unableToDetermineRegion", property_util.IAM_REGION.Name))
 	}
 
-	cacheKey := auth_helpers.GetCacheKey(
-		property_util.GetVerifiedWrapperPropertyValue[string](props, property_util.USER),
-		host,
-		port,
-		region,
-	)
+	user := property_util.GetVerifiedWrapperPropertyValue[string](props, property_util.USER)
+	cacheKey := auth_helpers.GetCacheKey(user, host, port, region)
 
 	token, cachedTokenFound := TokenCache.Get(cacheKey)
 	isCachedToken := cachedTokenFound && token != ""
@@ -153,18 +160,37 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 	conn, err := connectFunc(props)
 	if err == nil {
 		return conn, nil
-	} else {
-		slog.Debug(error_util.GetMessage("IamAuthPlugin.connectionError", hostInfo.GetHost(), err))
-		if !iamAuthPlugin.servicesContainer.GetPluginService().IsLoginError(err) || !isCachedToken {
-			return nil, err
-		}
+	}
+	slog.Debug(error_util.GetMessage("IamAuthPlugin.connectionError", hostInfo.GetHost(), err))
+	if !iamAuthPlugin.servicesContainer.GetPluginService().IsLoginError(err) {
+		return nil, err
 	}
 
-	// Login unsuccessful with cached token
-	// Try to generate a new token and connect again
-	err = iamAuthPlugin.fetchAndSetToken(hostInfo, host, port, region, cacheKey, props)
-	if err != nil {
+	// A login with a cached writer region can fail because a switchover moved the
+	// writer to another region. Resolve the region again; retry with a new token
+	// only if the region changed or the token was cached. Any other failure
+	// returns the original login error.
+	if regionFromCache {
+		refreshedRegion, refreshErr := refreshGdbRegion(host, props, region)
+		if refreshErr != nil {
+			slog.Warn(error_util.GetMessage("IamAuthPlugin.gdbRegionRefreshError", host, refreshErr))
+			return nil, err
+		}
+		if refreshedRegion != region {
+			slog.Info(error_util.GetMessage("IamAuthPlugin.cachedRegionLoginError", host, region, err, refreshedRegion))
+			region = refreshedRegion
+			cacheKey = auth_helpers.GetCacheKey(user, host, port, region)
+		} else if !isCachedToken {
+			return nil, err
+		}
+	} else if !isCachedToken {
 		return nil, err
+	}
+
+	// Login unsuccessful with a cached token or a stale cached region.
+	// Try to generate a new token and connect again.
+	if tokenErr := iamAuthPlugin.fetchAndSetToken(hostInfo, host, port, region, cacheKey, props); tokenErr != nil {
+		return nil, tokenErr
 	}
 
 	return connectFunc(props)
