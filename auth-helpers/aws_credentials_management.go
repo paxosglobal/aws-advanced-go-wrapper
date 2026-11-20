@@ -49,11 +49,32 @@ func SetAwsCredentialsProviderHandler(credentialsHandler AwsCredentialsProviderH
 	awsCredentialsProviderHandler = credentialsHandler
 }
 
+var defaultProviders = map[string]aws.CredentialsProvider{}
+
+var defaultProvidersLock sync.Mutex
+
+// getDefaultProvider returns one provider per profile for the life of the process.
+// LoadDefaultConfig wraps the provider in an aws.CredentialsCache, so a shared
+// provider reuses credentials until they expire. With a new provider per call,
+// each IAM connection fetched new credentials (an STS call under IRSA).
 func getDefaultProvider(profile string) (aws.CredentialsProvider, error) {
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	if provider, ok := defaultProviders[profile]; ok {
+		return provider, nil
+	}
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithSharedConfigProfile(profile))
 	if err != nil {
 		return nil, err
 	}
+	defaultProviders[profile] = cfg.Credentials
 	return cfg.Credentials, nil
+}
+
+// ClearDefaultCredentialsProviders drops the providers that getDefaultProvider shares.
+func ClearDefaultCredentialsProviders() {
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	defaultProviders = map[string]aws.CredentialsProvider{}
 }

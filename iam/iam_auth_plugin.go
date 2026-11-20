@@ -49,6 +49,8 @@ func (factory IamAuthPluginFactory) GetInstance(servicesContainer driver_infrast
 
 func (factory IamAuthPluginFactory) ClearCaches() {
 	TokenCache.Clear()
+	GdbRegionCache.Clear()
+	auth_helpers.ClearDefaultCredentialsProviders()
 }
 
 func NewIamAuthPluginFactory() driver_infrastructure.ConnectionPluginFactory {
@@ -117,13 +119,24 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 		property_util.GetVerifiedWrapperPropertyValue[int](props, property_util.IAM_DEFAULT_PORT),
 		*hostInfo, iamAuthPlugin.servicesContainer.GetPluginService().GetDialect().GetDefaultPort())
 
-	var regionProvider region_util.RegionProvider
-	if utils.IsGlobalDbWriterClusterDns(host) {
-		regionProvider = auth_helpers.NewGdbRegionProvider(nil)
+	// The region of a global writer endpoint is the current writer's region. It is
+	// cached as long as a token is, and resolved again when a login with it fails,
+	// because a switchover can move the writer to another region.
+	resolvesGdbRegion := utils.IsGlobalDbWriterClusterDns(host) &&
+		region_util.GetRegionFromProps(props, property_util.IAM_REGION) == ""
+	gdbRegionExpiration := time.Duration(property_util.GetExpirationValue(props, property_util.IAM_EXPIRATION_SEC)) * time.Second
+
+	var region region_util.Region
+	var regionFromCache bool
+	var regionErr error
+	if resolvesGdbRegion {
+		region, regionFromCache, regionErr = getGdbRegion(host, props, gdbRegionExpiration, false)
+		if regionFromCache {
+			slog.Debug(error_util.GetMessage("IamAuthPlugin.useCachedRegion", region, host))
+		}
 	} else {
-		regionProvider = &region_util.DefaultRegionProvider{}
+		region, regionErr = (&region_util.DefaultRegionProvider{}).GetRegion(host, props, property_util.IAM_REGION)
 	}
-	region, regionErr := regionProvider.GetRegion(host, props, property_util.IAM_REGION)
 	if regionErr != nil {
 		return nil, regionErr
 	}
@@ -131,12 +144,8 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 		return nil, errors.New(error_util.GetMessage("IamAuthPlugin.unableToDetermineRegion", property_util.IAM_REGION.Name))
 	}
 
-	cacheKey := auth_helpers.GetCacheKey(
-		property_util.GetVerifiedWrapperPropertyValue[string](props, property_util.USER),
-		host,
-		port,
-		region,
-	)
+	user := property_util.GetVerifiedWrapperPropertyValue[string](props, property_util.USER)
+	cacheKey := auth_helpers.GetCacheKey(user, host, port, region)
 
 	token, cachedTokenFound := TokenCache.Get(cacheKey)
 	isCachedToken := cachedTokenFound && token != ""
@@ -155,13 +164,23 @@ func (iamAuthPlugin *IamAuthPlugin) connectInternal(
 		return conn, nil
 	} else {
 		slog.Debug(error_util.GetMessage("IamAuthPlugin.connectionError", hostInfo.GetHost(), err))
-		if !iamAuthPlugin.servicesContainer.GetPluginService().IsLoginError(err) || !isCachedToken {
+		if !iamAuthPlugin.servicesContainer.GetPluginService().IsLoginError(err) || !(isCachedToken || regionFromCache) {
 			return nil, err
 		}
 	}
 
-	// Login unsuccessful with cached token
-	// Try to generate a new token and connect again
+	// Login unsuccessful with a cached token or a cached region.
+	// Resolve the region again if it was cached, generate a new token and connect again.
+	if regionFromCache {
+		cachedRegion := region
+		invalidateGdbRegion(host, props)
+		region, _, regionErr = getGdbRegion(host, props, gdbRegionExpiration, true)
+		if regionErr != nil {
+			return nil, regionErr
+		}
+		slog.Info(error_util.GetMessage("IamAuthPlugin.cachedRegionLoginError", host, cachedRegion, err, region))
+		cacheKey = auth_helpers.GetCacheKey(user, host, port, region)
+	}
 	err = iamAuthPlugin.fetchAndSetToken(hostInfo, host, port, region, cacheKey, props)
 	if err != nil {
 		return nil, err
