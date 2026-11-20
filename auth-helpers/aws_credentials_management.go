@@ -49,7 +49,12 @@ func SetAwsCredentialsProviderHandler(credentialsHandler AwsCredentialsProviderH
 	awsCredentialsProviderHandler = credentialsHandler
 }
 
-var defaultProviders = map[string]aws.CredentialsProvider{}
+type defaultCredentials struct {
+	provider  aws.CredentialsProvider
+	rdsClient RdsDescribeGlobalClustersClient
+}
+
+var defaultProviders = map[string]*defaultCredentials{}
 
 var defaultProvidersLock sync.Mutex
 
@@ -60,21 +65,43 @@ var defaultProvidersLock sync.Mutex
 func getDefaultProvider(profile string) (aws.CredentialsProvider, error) {
 	defaultProvidersLock.Lock()
 	defer defaultProvidersLock.Unlock()
-	if provider, ok := defaultProviders[profile]; ok {
-		return provider, nil
+	if entry, ok := defaultProviders[profile]; ok {
+		return entry.provider, nil
 	}
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithSharedConfigProfile(profile))
 	if err != nil {
 		return nil, err
 	}
-	defaultProviders[profile] = cfg.Credentials
+	defaultProviders[profile] = &defaultCredentials{provider: cfg.Credentials}
 	return cfg.Credentials, nil
 }
 
-// ClearDefaultCredentialsProviders drops the providers that getDefaultProvider shares.
+// sharedRdsClient returns one RDS client per provider that getDefaultProvider
+// shares, and nil for any other provider. Only *aws.CredentialsCache values are
+// compared, so a provider of a type that is not comparable cannot panic here.
+func sharedRdsClient(credentialsProvider aws.CredentialsProvider) RdsDescribeGlobalClustersClient {
+	cache, ok := credentialsProvider.(*aws.CredentialsCache)
+	if !ok || cache == nil {
+		return nil
+	}
+	defaultProvidersLock.Lock()
+	defer defaultProvidersLock.Unlock()
+	for _, entry := range defaultProviders {
+		if shared, ok := entry.provider.(*aws.CredentialsCache); ok && shared == cache {
+			if entry.rdsClient == nil {
+				entry.rdsClient = NewRdsClient(credentialsProvider)
+			}
+			return entry.rdsClient
+		}
+	}
+	return nil
+}
+
+// ClearDefaultCredentialsProviders drops the providers and RDS clients that
+// getDefaultProvider and sharedRdsClient share.
 func ClearDefaultCredentialsProviders() {
 	defaultProvidersLock.Lock()
 	defer defaultProvidersLock.Unlock()
-	defaultProviders = map[string]aws.CredentialsProvider{}
+	defaultProviders = map[string]*defaultCredentials{}
 }
